@@ -552,7 +552,7 @@ jobs:
               }'''
 
           text = replace_required(
-              text, old_preferences, new_preferences
+              text, ".getInt(KEY_WIDTH_PERCENT, 56);", ".getInt(KEY_WIDTH_PERCENT, 98);"
           )
 
           result_start = text.index(
