@@ -1,0 +1,61 @@
+name: Prepare Android Source
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "WheelMovementTracker-SafeOverlay-v2.5-source.zip"
+      - ".github/workflows/main.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  unpack-source:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v4
+
+      - name: Unpack project
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf _wheel_source
+          mkdir _wheel_source
+
+          unzip -q WheelMovementTracker-SafeOverlay-v2.5-source.zip \
+            -d _wheel_source
+
+          source_dir="_wheel_source"
+          mapfile -t entries < <(
+            find _wheel_source -mindepth 1 -maxdepth 1 -print
+          )
+
+          if [ "${#entries[@]}" -eq 1 ] && [ -d "${entries[0]}" ]; then
+            source_dir="${entries[0]}"
+          fi
+
+          rsync -a \
+            --exclude=".git/" \
+            --exclude=".github/" \
+            --exclude="local.properties" \
+            "$source_dir/" ./
+
+          rm -rf _wheel_source
+          if [ -f gradlew ]; then chmod +x gradlew; fi
+
+      - name: Save unpacked source
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .
+          git diff --cached --quiet || \
+            git commit -m "Unpack Wheel Tracker v2.5 source"
+
+          git push
