@@ -1,10 +1,9 @@
-name: Prepare Android Source
+name: Build Wheel Tracker v2.6
 
 on:
   push:
     branches: [main]
     paths:
-      - "WheelMovementTracker-SafeOverlay-v2.5-source.zip"
       - ".github/workflows/main.yml"
   workflow_dispatch:
 
@@ -12,50 +11,751 @@ permissions:
   contents: write
 
 jobs:
-  unpack-source:
+  build-v26:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download repository
+      - name: Download source
         uses: actions/checkout@v4
 
-      - name: Unpack project
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Upgrade source to v2.6
         shell: bash
         run: |
-          set -euo pipefail
-          rm -rf _wheel_source
-          mkdir _wheel_source
+          python3 - <<'PY'
+          from pathlib import Path
 
-          unzip -q WheelMovementTracker-SafeOverlay-v2.5-source.zip \
-            -d _wheel_source
+          def replace_required(text, old, new):
+              if old not in text:
+                  raise RuntimeError("Required source section was not found:\n" + old[:120])
+              return text.replace(old, new)
 
-          source_dir="_wheel_source"
-          mapfile -t entries < <(
-            find _wheel_source -mindepth 1 -maxdepth 1 -print
+          # Version and storage capacity
+          path = Path("app/build.gradle")
+          text = path.read_text()
+          text = replace_required(text, "versionCode 25", "versionCode 26")
+          text = replace_required(text, "versionName '2.5.0'", "versionName '2.6.0'")
+          path.write_text(text)
+
+          # Compact main screen and CSV controls
+          path = Path(
+              "app/src/main/java/com/mallupai/wheelmovementtracker/MainActivity.java"
+          )
+          text = path.read_text()
+          text = text.replace("2000", "5000")
+          text = text.replace('"EXPORT DATA"', '"EXPORT CSV"')
+          text = text.replace('"IMPORT DATA"', '"IMPORT CSV / JSON"')
+
+          old_type = 'intent.setType("application/json");'
+          text = replace_required(text, old_type, 'intent.setType("text/csv");')
+          text = replace_required(text, old_type, 'intent.setType("*/*");')
+
+          text = text.replace(
+              '"WheelTracker-data.json"',
+              '"WheelTracker-data.csv"'
+          )
+          text = text.replace(
+              "writer.write(store.exportJson());",
+              "writer.write(store.exportCsv());"
+          )
+          text = text.replace(
+              "MovementStore.ImportResult result = store.importJson(raw, merge);",
+              "MovementStore.ImportResult result = store.importData(raw, merge);"
+          )
+          path.write_text(text)
+
+          # Storage, floating history and performance summaries
+          path = Path(
+              "app/src/main/java/com/mallupai/wheelmovementtracker/MovementStore.java"
+          )
+          text = path.read_text()
+          text = replace_required(
+              text,
+              "private static final int MAX_ROUNDS = 2000;",
+              "private static final int MAX_ROUNDS = 5000;"
           )
 
-          if [ "${#entries[@]}" -eq 1 ] && [ -d "${entries[0]}" ]; then
-            source_dir="${entries[0]}"
-          fi
+          marker = "    public synchronized String exportJson() {"
+          additions = r'''
+              public synchronized String exportCsv() {
+                  return CsvSupport.export(read());
+              }
 
-          rsync -a \
-            --exclude=".git/" \
-            --exclude=".github/" \
-            --exclude="local.properties" \
-            "$source_dir/" ./
+              public synchronized ImportResult importData(
+                      String raw, boolean merge) throws Exception {
+                  if (raw == null || raw.trim().isEmpty()) {
+                      throw new Exception("The selected file is empty");
+                  }
+                  String trimmed = raw.trim();
+                  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+                      return importJson(raw, merge);
+                  }
+                  return importJson(CsvSupport.toTrackerJson(raw), merge);
+              }
 
-          rm -rf _wheel_source
-          if [ -f gradlew ]; then chmod +x gradlew; fi
+              public synchronized String recentNamesLine(int count) {
+                  JSONArray data = read();
+                  int first = Math.max(0, data.length() - Math.max(1, count));
+                  StringBuilder out = new StringBuilder();
+                  for (int i = first; i < data.length(); i++) {
+                      JSONObject row = data.optJSONObject(i);
+                      if (row == null) continue;
+                      int position = normalizePosition(
+                              row.optInt("winnerPosition", 0));
+                      if (position == 0) continue;
+                      if (out.length() > 0) out.append(" → ");
+                      out.append(WheelLabels.nameForPosition(position));
+                  }
+                  return out.length() == 0 ? "waiting" : out.toString();
+              }
 
-      - name: Save unpacked source
+              public synchronized String recentMovementsLine(int count) {
+                  JSONArray data = read();
+                  int first = Math.max(0, data.length() - Math.max(1, count));
+                  StringBuilder out = new StringBuilder();
+                  for (int i = first; i < data.length(); i++) {
+                      JSONObject row = data.optJSONObject(i);
+                      if (row == null) continue;
+                      if (out.length() > 0) out.append(" → ");
+                      out.append(PatternAnalyzer.format(
+                              mod9(row.optInt("movement", 0))));
+                  }
+                  return out.length() == 0 ? "waiting" : out.toString();
+              }
+
+              public synchronized String scannedPatternLine() {
+                  PatternAnalyzer.Prediction prediction = movementPrediction();
+                  if (prediction == null
+                          || prediction.repeatedCount < 2
+                          || prediction.repeatedPattern == null
+                          || prediction.repeatedPattern.isEmpty()) {
+                      return "PATTERN none yet";
+                  }
+                  return "PATTERN " + prediction.repeatedPattern
+                          + " ×" + prediction.repeatedCount;
+              }
+
+              public synchronized String fruitPerformanceCompact() {
+                  JSONArray data = read();
+                  int wins = 0;
+                  int losses = 0;
+                  double profit = 0;
+                  for (int i = 0; i < data.length(); i++) {
+                      JSONObject row = data.optJSONObject(i);
+                      if (row == null
+                              || !row.optBoolean("eligible", false)
+                              || !row.has("fruitPrediction")) {
+                          continue;
+                      }
+                      if (row.optBoolean("fruitTop1", false)) wins++;
+                      else losses++;
+                      profit += row.optDouble("fruitProfitUnits", 0);
+                  }
+                  int total = wins + losses;
+                  if (total == 0) {
+                      return "SCAN W/L 0/0 • HIT -- • PROFIT --";
+                  }
+                  return String.format(Locale.US,
+                          "SCAN W/L %d/%d • HIT %.1f%% • PROFIT %+.1f%%",
+                          wins, losses, wins * 100.0 / total,
+                          profit * 100.0 / total);
+              }
+
+          '''
+          text = replace_required(text, marker, additions + marker)
+          path.write_text(text)
+
+          # Full CSV export and CSV/legacy-JSON import
+          csv_support = r'''package com.mallupai.wheelmovementtracker;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+
+          /** CSV interchange for reporting and back-testing. */
+          final class CsvSupport {
+              private CsvSupport() {
+              }
+
+              static String export(JSONArray data) {
+                  StringBuilder out = new StringBuilder();
+                  addRow(out,
+                          "sequence",
+                          "round",
+                          "start_position",
+                          "start_name",
+                          "winner_position",
+                          "winner_name",
+                          "name_movement",
+                          "winner_fruit",
+                          "clockwise_steps",
+                          "anticlockwise_steps",
+                          "movement_display",
+                          "forecast_movement_clockwise",
+                          "forecast_movement_anticlockwise",
+                          "forecast_name",
+                          "fruit_prediction",
+                          "fruit_prediction_percent",
+                          "eligible",
+                          "movement_result",
+                          "name_result",
+                          "fruit_result",
+                          "profit_units",
+                          "source");
+
+                  for (int i = 0; i < data.length(); i++) {
+                      JSONObject row = data.optJSONObject(i);
+                      if (row == null) continue;
+
+                      int movement = mod9(row.optInt("movement", 0));
+                      int anticlockwise = movement == 0 ? 0 : movement - 9;
+                      int predicted = mod9(
+                              row.optInt("movementPrediction", 0));
+                      int predictedAnti = predicted == 0 ? 0 : predicted - 9;
+                      int namePrediction = row.optInt("namePrediction", -1);
+                      boolean eligible = row.optBoolean("eligible", false);
+
+                      String forecastName =
+                              namePrediction >= 0 && namePrediction <= 8
+                                      ? WheelLabels.nameForPosition(
+                                              namePrediction + 1)
+                                      : "";
+
+                      addRow(out,
+                              row.optInt("sequence", i + 1),
+                              row.optInt("round", -1),
+                              row.optInt("startPosition", 0),
+                              row.optString("startName", ""),
+                              row.optInt("winnerPosition", 0),
+                              row.optString("winnerName", ""),
+                              row.optString("startName", "") + " → "
+                                      + row.optString("winnerName", ""),
+                              row.optString("winnerFruit", ""),
+                              movement,
+                              anticlockwise,
+                              PatternAnalyzer.format(movement),
+                              predicted,
+                              predictedAnti,
+                              forecastName,
+                              row.optString("fruitPrediction", ""),
+                              String.format(Locale.US, "%.2f",
+                                      row.optDouble(
+                                              "fruitPredictionPercent", 0)),
+                              eligible,
+                              eligible
+                                      ? (row.optBoolean(
+                                              "movementTop1", false)
+                                              ? "WIN" : "LOSS")
+                                      : "",
+                              eligible
+                                      ? (row.optBoolean(
+                                              "nameTop1", false)
+                                              ? "WIN" : "LOSS")
+                                      : "",
+                              eligible && row.has("fruitPrediction")
+                                      ? (row.optBoolean(
+                                              "fruitTop1", false)
+                                              ? "WIN" : "LOSS")
+                                      : "",
+                              String.format(Locale.US, "%.2f",
+                                      row.optDouble("fruitProfitUnits", 0)),
+                              row.optString("source", ""));
+                  }
+                  return out.toString();
+              }
+
+              static String toTrackerJson(String raw) throws Exception {
+                  String cleaned = raw == null
+                          ? "" : raw.replace("\r", "");
+                  String[] lines = cleaned.split("\n");
+                  if (lines.length < 2) {
+                      throw new Exception("CSV contains no round records");
+                  }
+
+                  List<String> header = parseLine(lines[0]);
+                  Map<String, Integer> columns = new HashMap<>();
+                  for (int i = 0; i < header.size(); i++) {
+                      String key = header.get(i).trim()
+                              .replace("\uFEFF", "")
+                              .toLowerCase(Locale.US);
+                      columns.put(key, i);
+                  }
+
+                  JSONArray rows = new JSONArray();
+                  for (int line = 1; line < lines.length; line++) {
+                      if (lines[line].trim().isEmpty()) continue;
+                      List<String> values = parseLine(lines[line]);
+
+                      int start = number(value(
+                              columns, values, "start_position"), 0);
+                      int winner = number(value(
+                              columns, values, "winner_position"), 0);
+
+                      String startName = value(
+                              columns, values, "start_name");
+                      String winnerName = value(
+                              columns, values, "winner_name");
+
+                      if (start == 0) start = positionForName(startName);
+                      if (winner == 0) winner = positionForName(winnerName);
+
+                      String nameMovement = value(
+                              columns, values, "name_movement");
+                      if ((start == 0 || winner == 0)
+                              && !nameMovement.isEmpty()) {
+                          String normalized = nameMovement.replace("->", "→");
+                          String[] pair = normalized.split("→");
+                          if (pair.length == 2) {
+                              if (start == 0) {
+                                  start = positionForName(pair[0].trim());
+                              }
+                              if (winner == 0) {
+                                  winner = positionForName(pair[1].trim());
+                              }
+                          }
+                      }
+
+                      if (start < 1 || start > 9
+                              || winner < 1 || winner > 9) {
+                          continue;
+                      }
+
+                      int movement = number(value(
+                              columns, values, "clockwise_steps"), -99);
+                      if (movement == -99) {
+                          movement = mod9(winner - start);
+                      }
+                      movement = mod9(movement);
+
+                      JSONObject row = new JSONObject();
+                      row.put("sequence", number(value(
+                              columns, values, "sequence"),
+                              rows.length() + 1));
+                      row.put("round", number(value(
+                              columns, values, "round"), -1));
+                      row.put("startPosition", start);
+                      row.put("winnerPosition", winner);
+                      row.put("startName",
+                              WheelLabels.nameForPosition(start));
+                      row.put("winnerName",
+                              WheelLabels.nameForPosition(winner));
+                      row.put("winnerFruit",
+                              WheelLabels.fruitForPosition(winner));
+                      row.put("movement", movement);
+
+                      int forecastMovement = number(value(
+                              columns, values,
+                              "forecast_movement_clockwise"), 0);
+                      row.put("movementPrediction",
+                              mod9(forecastMovement));
+
+                      int forecastNamePosition = positionForName(value(
+                              columns, values, "forecast_name"));
+                      row.put("namePrediction",
+                              forecastNamePosition > 0
+                                      ? forecastNamePosition - 1 : -1);
+
+                      boolean eligible = truth(value(
+                              columns, values, "eligible"));
+                      row.put("eligible", eligible);
+                      row.put("movementTop1", "WIN".equalsIgnoreCase(
+                              value(columns, values,
+                                      "movement_result")));
+                      row.put("nameTop1", "WIN".equalsIgnoreCase(
+                              value(columns, values, "name_result")));
+                      row.put("fruitTop1", "WIN".equalsIgnoreCase(
+                              value(columns, values, "fruit_result")));
+                      row.put("fruitPrediction", value(
+                              columns, values, "fruit_prediction"));
+                      row.put("fruitPredictionPercent", decimal(value(
+                              columns, values,
+                              "fruit_prediction_percent"), 0));
+                      row.put("fruitProfitUnits", decimal(value(
+                              columns, values, "profit_units"), 0));
+                      row.put("source", "imported-csv");
+                      rows.put(row);
+                  }
+
+                  if (rows.length() == 0) {
+                      throw new Exception(
+                              "No valid CSV round records were found");
+                  }
+
+                  JSONObject root = new JSONObject();
+                  root.put("format", "wheel-movement-tracker");
+                  root.put("dataVersion", 2);
+                  root.put("rounds", rows);
+                  return root.toString();
+              }
+
+              private static void addRow(
+                      StringBuilder out, Object... values) {
+                  for (int i = 0; i < values.length; i++) {
+                      if (i > 0) out.append(',');
+                      out.append(escape(String.valueOf(values[i])));
+                  }
+                  out.append('\n');
+              }
+
+              private static String escape(String value) {
+                  if (value == null) return "";
+                  if (!value.contains(",")
+                          && !value.contains("\"")
+                          && !value.contains("\n")) {
+                      return value;
+                  }
+                  return "\"" + value.replace("\"", "\"\"") + "\"";
+              }
+
+              private static List<String> parseLine(String line) {
+                  List<String> values = new ArrayList<>();
+                  StringBuilder current = new StringBuilder();
+                  boolean quoted = false;
+
+                  for (int i = 0; i < line.length(); i++) {
+                      char character = line.charAt(i);
+                      if (character == '"') {
+                          if (quoted && i + 1 < line.length()
+                                  && line.charAt(i + 1) == '"') {
+                              current.append('"');
+                              i++;
+                          } else {
+                              quoted = !quoted;
+                          }
+                      } else if (character == ',' && !quoted) {
+                          values.add(current.toString());
+                          current.setLength(0);
+                      } else {
+                          current.append(character);
+                      }
+                  }
+                  values.add(current.toString());
+                  return values;
+              }
+
+              private static String value(
+                      Map<String, Integer> columns,
+                      List<String> values,
+                      String key) {
+                  Integer index = columns.get(key);
+                  if (index == null || index < 0
+                          || index >= values.size()) {
+                      return "";
+                  }
+                  return values.get(index).trim();
+              }
+
+              private static int number(String value, int fallback) {
+                  try {
+                      return Integer.parseInt(value.trim());
+                  } catch (Exception ignored) {
+                      return fallback;
+                  }
+              }
+
+              private static double decimal(
+                      String value, double fallback) {
+                  try {
+                      return Double.parseDouble(
+                              value.replace("%", "").trim());
+                  } catch (Exception ignored) {
+                      return fallback;
+                  }
+              }
+
+              private static boolean truth(String value) {
+                  return "true".equalsIgnoreCase(value)
+                          || "yes".equalsIgnoreCase(value)
+                          || "1".equals(value);
+              }
+
+              private static int positionForName(String value) {
+                  if (value == null) return 0;
+                  String name = value.trim().toLowerCase(Locale.US);
+                  for (int position = 1; position <= 9; position++) {
+                      if (WheelLabels.nameForPosition(position)
+                              .equalsIgnoreCase(name)) {
+                          return position;
+                      }
+                  }
+                  return 0;
+              }
+
+              private static int mod9(int value) {
+                  int result = value % 9;
+                  return result < 0 ? result + 9 : result;
+              }
+          }
+          '''
+          Path(
+              "app/src/main/java/com/mallupai/wheelmovementtracker/CsvSupport.java"
+          ).write_text(csv_support)
+
+          # Rebuild the floating overlay
+          path = Path(
+              "app/src/main/java/com/mallupai/wheelmovementtracker/CaptureService.java"
+          )
+          text = path.read_text()
+
+          text = replace_required(
+              text,
+              "import android.content.Intent;",
+              "import android.content.Intent;\n"
+              "import android.content.SharedPreferences;"
+          )
+
+          text = replace_required(
+              text,
+              'private static final String KEY_HEIGHT_PERCENT = "height_percent";',
+              'private static final String KEY_HEIGHT_PERCENT = "height_percent";\n'
+              '    private static final String KEY_LAYOUT_V26 = "layout_v26";'
+          )
+
+          text = replace_required(
+              text,
+              "    private TextView miniSummaryView;",
+              "    private TextView miniSummaryView;\n"
+              "    private TextView recentNamesView;\n"
+              "    private TextView recentMovesView;"
+          )
+
+          old_preferences = '''        overlayWidthPercent = getSharedPreferences(OVERLAY_PREF, MODE_PRIVATE)
+                  .getInt(KEY_WIDTH_PERCENT, 56);
+              overlayHeightPercent = getSharedPreferences(OVERLAY_PREF, MODE_PRIVATE)
+                  .getInt(KEY_HEIGHT_PERCENT, 20);'''
+
+          new_preferences = '''        SharedPreferences overlayPreferences =
+                  getSharedPreferences(OVERLAY_PREF, MODE_PRIVATE);
+              if (!overlayPreferences.getBoolean(KEY_LAYOUT_V26, false)) {
+                  overlayWidthPercent = 98;
+                  overlayHeightPercent = 20;
+                  overlayPreferences.edit()
+                          .putInt(KEY_WIDTH_PERCENT, overlayWidthPercent)
+                          .putInt(KEY_HEIGHT_PERCENT, overlayHeightPercent)
+                          .putBoolean(KEY_LAYOUT_V26, true)
+                          .apply();
+              } else {
+                  overlayWidthPercent = overlayPreferences
+                          .getInt(KEY_WIDTH_PERCENT, 98);
+                  overlayHeightPercent = overlayPreferences
+                          .getInt(KEY_HEIGHT_PERCENT, 20);
+              }'''
+
+          text = replace_required(
+              text, old_preferences, new_preferences
+          )
+
+          result_start = text.index(
+              "        LinearLayout resultContent = sectionContent();"
+          )
+          probability_start = text.index(
+              "        probabilityView = overlayLabel",
+              result_start
+          )
+
+          live_rows = '''        recentNamesView = overlayLabel(
+                  "waiting", 8, 0xFFF4F7FF);
+              recentNamesView.setTypeface(
+                  Typeface.MONOSPACE, Typeface.BOLD);
+              fixedLines(recentNamesView, 1);
+              addCollapsibleSection(
+                  overlayBody,
+                  "LIVE NAMES • LAST 10",
+                  recentNamesView,
+                  true);
+
+              recentMovesView = overlayLabel(
+                  "waiting", 7, 0xFF7CFFAA);
+              recentMovesView.setTypeface(
+                  Typeface.MONOSPACE, Typeface.BOLD);
+              fixedLines(recentMovesView, 1);
+              addCollapsibleSection(
+                  overlayBody,
+                  "LIVE MOVES • LAST 10",
+                  recentMovesView,
+                  true);
+
+          '''
+
+          text = (
+              text[:result_start]
+              + live_rows
+              + text[probability_start:]
+          )
+
+          score_start = text.index(
+              "        LinearLayout scoreContent = sectionContent();"
+          )
+          fruit_start = text.index(
+              "        fruitView = overlayLabel",
+              score_start
+          )
+          text = text[:score_start] + text[fruit_start:]
+
+          text = text.replace(
+              'fruitView = overlayLabel("FINAL • LEARNING\\nM --  W --  77 --\\nMove --  Name --", 10,',
+              'fruitView = overlayLabel("FINAL • LEARNING\\n'
+              'M --  W --  77 --\\nMOVE --  NAME --\\n'
+              'PATTERN none yet\\nSCAN W/L 0/0 • PROFIT --", 9,'
+          )
+          text = text.replace(
+              "fixedLines(fruitView, 3);",
+              "fixedLines(fruitView, 5);"
+          )
+          text = text.replace(
+              'addCollapsibleSection(overlayBody, "FINAL FRUIT", fruitView, false);',
+              'addCollapsibleSection(overlayBody, "FINAL FRUIT", fruitView, true);'
+          )
+
+          text = text.replace(
+              "Math.max(36, Math.min(72, overlayWidthPercent))",
+              "Math.max(40, Math.min(98, overlayWidthPercent))"
+          )
+          text = text.replace(
+              "screenWidth - dp(16)",
+              "screenWidth - dp(4)"
+          )
+          text = text.replace(
+              "Math.round(screenWidth * .36f)",
+              "Math.round(screenWidth * .40f)"
+          )
+          text = text.replace(
+              "int maxWidth = Math.round(screenWidth * .72f);",
+              "int maxWidth = screenWidth - dp(4);"
+          )
+          text = text.replace(
+              "overlayParams.x = dp(6);",
+              "overlayParams.x = dp(2);"
+          )
+
+          dashboard_marker = "        if (patternView != null) {"
+          live_update = '''        if (recentNamesView != null) {
+                  recentNamesView.setText(store.recentNamesLine(10));
+              }
+              if (recentMovesView != null) {
+                  recentMovesView.setText(store.recentMovementsLine(10));
+              }
+          '''
+          text = replace_required(
+              text,
+              dashboard_marker,
+              live_update + dashboard_marker
+          )
+
+          dashboard_start = text.index(
+              "    private void updateDashboard()"
+          )
+          fruit_block_start = text.index(
+              "        if (fruitView != null) {",
+              dashboard_start
+          )
+          fruit_block_end = text.index(
+              "        updateMiniSummary(fruit);",
+              fruit_block_start
+          )
+
+          fruit_block = '''        if (fruitView != null) {
+                  String patternLine = store.scannedPatternLine();
+                  String performanceLine =
+                          store.fruitPerformanceCompact();
+                  if (forecastReady) {
+                      fruitView.setText(String.format(Locale.US,
+                              "FINAL %s %.0f%%\\n"
+                                      + "M %.0f%%  W %.0f%%  77 %.0f%%\\n"
+                                      + "MOVE %.0f%%  NAME %.0f%%  %s\\n"
+                                      + "%s\\n%s",
+                              fruit.winnerName(), currentPercent,
+                              fruit.combinedScores[
+                                      FruitConsensus.MANGO] * 100.0,
+                              fruit.combinedScores[
+                                      FruitConsensus.WATERMELON] * 100.0,
+                              fruit.combinedScores[
+                                      FruitConsensus.SEVENTY_SEVEN] * 100.0,
+                              fruit.movementScores[
+                                      fruit.winner] * 100.0,
+                              fruit.namedScores[
+                                      fruit.winner] * 100.0,
+                              fruit.analysesAgree ? "AGREE" : "MIXED",
+                              patternLine,
+                              performanceLine));
+                      fruitView.setTextColor(
+                              fruitColor(fruit.winner));
+                  } else {
+                      fruitView.setText(String.format(Locale.US,
+                              "WAIT • NO FORECAST\\n"
+                                      + "SAMPLES %d/%d\\n"
+                                      + "SCORE %.0f%%/%d%%\\n"
+                                      + "%s\\n%s",
+                              savedSamples, requiredSamples,
+                              currentPercent, requiredPercent,
+                              patternLine, performanceLine));
+                      fruitView.setTextColor(0xFFAAB4CA);
+                  }
+              }
+          '''
+
+          text = (
+              text[:fruit_block_start]
+              + fruit_block
+              + text[fruit_block_end:]
+          )
+
+          path.write_text(text)
+          PY
+
+      - name: Build signed release APK
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --console=plain clean assembleRelease \
+            -x lintVitalAnalyzeRelease \
+            -x lintVitalReportRelease \
+            -x lintVitalRelease \
+            -x compileReleaseArtProfile
+
+      - name: Package APK and source
+        shell: bash
+        run: |
+          cp app/build/outputs/apk/release/app-release.apk \
+            WheelMovementTracker-v2.6.apk
+
+          rm -f WheelMovementTracker-v2.6-source.zip
+          zip -qr WheelMovementTracker-v2.6-source.zip \
+            app \
+            gradle \
+            gradlew \
+            gradlew.bat \
+            build.gradle \
+            settings.gradle \
+            gradle.properties \
+            README.md \
+            .github/workflows/main.yml \
+            -x "app/build/*" \
+            -x "*/.gradle/*" \
+            -x "local.properties"
+
+      - name: Upload downloadable files
+        uses: actions/upload-artifact@v4
+        with:
+          name: WheelMovementTracker-v2.6
+          path: |
+            WheelMovementTracker-v2.6.apk
+            WheelMovementTracker-v2.6-source.zip
+          retention-days: 30
+
+      - name: Save v2.6 in repository
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add .
-          git diff --cached --quiet || \
-            git commit -m "Unpack Wheel Tracker v2.5 source"
-
-          git push
+            "41898282+github-actions[bot]@
