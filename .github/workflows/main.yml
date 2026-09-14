@@ -33,7 +33,7 @@ jobs:
           def replace_required(text, old, new):
               if old not in text:
                   raise RuntimeError("Required source section was not found:\n" + old[:120])
-              return text.replace(old, new)
+              return text.replace(old, new, 1)
 
           # Version and storage capacity
           path = Path("app/build.gradle")
